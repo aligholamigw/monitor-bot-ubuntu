@@ -83,7 +83,12 @@ final class LiveResult
             foreach ($r['checks'] ?? [] as $c) {
                 if (isset($byCheck[$c['name'] ?? ''])) { return LiveVerdict::Inconclusive; }
                 $byCheck[$c['name'] ?? ''] = $c;
-                if (preg_match('/\b429\b|rate.limit|quota|worker.offline|limit.exceeded|job.expired/i', (string)($c['detail'] ?? ''))) {
+                $detail = (string)($c['detail'] ?? '');
+                // The worker embeds the download service's HTTP error in this check.
+                // A quota error from the Live API itself is handled by the request code.
+                $limitedDownloadProbe = ($c['name'] ?? '') === 'download' && ($c['status'] ?? '') === 'error'
+                    && preg_match('~https://speed\.cloudflare\.com/__down(?=[?\x22\x27\s]|$)~i', $detail);
+                if (!$limitedDownloadProbe && preg_match('/\b429\b|rate.limit|quota|worker.offline|limit.exceeded|job.expired/i', $detail)) {
                     return LiveVerdict::Inconclusive;
                 }
                 if (in_array($c['name'] ?? '', array_merge(['connect'], $checks), true)
