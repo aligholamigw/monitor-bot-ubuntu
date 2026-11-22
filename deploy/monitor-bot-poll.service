@@ -1,0 +1,24 @@
+[Unit]
+Description=Monitor Bot Telegram Polling
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=monitorbot
+Group=monitorbot
+Environment=MONITOR_BOT_CONFIG=/etc/monitor-bot/config.php
+ExecStart=/usr/bin/php /opt/monitor-bot/bin/poll.php
+WorkingDirectory=/opt/monitor-bot
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/monitor-bot
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

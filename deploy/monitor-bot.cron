@@ -1,0 +1,5 @@
+SHELL=/bin/sh
+PATH=/usr/bin:/bin
+MAILTO=""
+MONITOR_BOT_CONFIG=/etc/monitor-bot/config.php
+* * * * * monitorbot /usr/bin/php /opt/monitor-bot/bin/cron.php 2>&1 | /usr/bin/logger -t monitor-bot-cron

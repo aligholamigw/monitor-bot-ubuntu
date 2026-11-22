@@ -1,0 +1,6 @@
+.tools/
+config.php
+var/
+monitor-status*.json
+dist/
+*.log
