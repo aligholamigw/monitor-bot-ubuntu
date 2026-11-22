@@ -4,10 +4,10 @@
 
 ## نصب
 
-روی Ubuntu 24.04 با دسترسی sudo و SSH فعال به مخزن خصوصی اجرا کنید:
+روی Ubuntu 24.04 با دسترسی sudo اجرا کنید:
 
 ```bash
-git clone git@github.com:aligholamigw/monitor-bot-ubuntu.git && cd monitor-bot-ubuntu && sudo bash install.sh
+git clone https://github.com/aligholamigw/monitor-bot-ubuntu.git && cd monitor-bot-ubuntu && sudo bash install.sh
 ```
 
 اگر بستهٔ ZIP را منتقل کرده‌اید، پس از استخراج در پوشهٔ بسته `sudo bash install.sh` را اجرا کنید. در نصب اول، نشانی کامل Status، توکن ربات، شناسهٔ عددی مدیر تلگرام، Zone ID و توکن DNS کلودفلر و لینک کامل VLESS از ترمینال دریافت می‌شوند. برای مسیر مستقیم، ورودی اختیاری SOCKS5 را خالی بگذارید. مقادیر حساس در دستور نصب یا خروجی ترمینال ظاهر نمی‌شوند.
