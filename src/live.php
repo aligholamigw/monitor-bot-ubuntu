@@ -42,6 +42,7 @@ final class VlessTemplate
 enum LiveVerdict
 {
     case Green;
+    case GreenWithDownloadError;
     case Unsuitable;
     case Inconclusive;
 }
@@ -68,6 +69,7 @@ final class LiveResult
         if (!is_array($results) || count($results) !== count($workers)) { return LiveVerdict::Inconclusive; }
         $seen = [];
         $unsuitable = false;
+        $downloadError = false;
         foreach ($results as $r) {
             $worker = $r['worker_id'] ?? '';
             if (!in_array($worker, $workers, true) || isset($seen[$worker])
@@ -97,8 +99,12 @@ final class LiveResult
             if (!in_array($summary, ['ok', 'weak'], true)) { return LiveVerdict::Inconclusive; }
             foreach (array_merge(['connect'], $checks) as $name) {
                 $c = $byCheck[$name] ?? [];
-                // Match the dashboard's overall green. Weak throughput can coexist with
-                // green summary, but missing/failed additional checks are never accepted.
+                // Only a reported download error can qualify for the secondary group.
+                // Connection, upload and jitter still require numeric results on every node.
+                if ($name === 'download' && $summary === 'ok' && ($c['status'] ?? '') === 'error') {
+                    $downloadError = true;
+                    continue;
+                }
                 $allowed = $name === 'connect' ? ['ok'] : ['ok', 'weak'];
                 if (!in_array($c['status'] ?? '', $allowed, true) || !is_numeric($c['value'] ?? null)
                     || !is_finite((float)$c['value']) || (float)$c['value'] < 0
@@ -106,7 +112,8 @@ final class LiveResult
             }
             if ($summary === 'weak') { $unsuitable = true; }
         }
-        return $unsuitable ? LiveVerdict::Unsuitable : LiveVerdict::Green;
+        if ($unsuitable) { return LiveVerdict::Unsuitable; }
+        return $downloadError ? LiveVerdict::GreenWithDownloadError : LiveVerdict::Green;
     }
 }
 
@@ -124,6 +131,33 @@ trait LiveOperations
         return hash('sha256', json_encode([$this->config['live_template'] ?? '', $this->config['live_workers'], $this->config['live_checks'], 1], JSON_THROW_ON_ERROR));
     }
     private function readyCount(): int { return count(array_filter($this->state['pool'], fn($p) => $p['status'] === 'available')); }
+
+    private function poolDownloadGroup(array $entry): string
+    {
+        return $entry['download_group'] ?? (
+            ($entry['via'] ?? '') === 'live-four-workers' && !empty($entry['verified_at']) ? 'complete' : 'unknown'
+        );
+    }
+
+    private function poolCandidate(array $excluded = [], bool $completeOnly = false): ?string
+    {
+        $selected = null;
+        $priority = 3;
+        foreach ($this->state['pool'] as $ip => $entry) {
+            if ($entry['status'] !== 'available' || in_array($ip, $excluded, true) || $this->poolIPProtected($ip)) { continue; }
+            $rank = match ($this->poolDownloadGroup($entry)) {
+                'complete' => 0,
+                'fallback' => 2,
+                default => 1,
+            };
+            if ($rank === 0) { return $ip; }
+            if (!$completeOnly && $rank < $priority) {
+                $selected = $ip;
+                $priority = $rank;
+            }
+        }
+        return $selected;
+    }
     private function proofFresh(string $domain, int $now): bool
     {
         $pending = $this->state['targets'][$domain]['pending'] ?? [];
@@ -148,11 +182,24 @@ trait LiveOperations
     {
         return (int)array_sum(array_map(fn($r) => max(0, $r['end'] - $r['next'] + 1), $this->state['scan']['ranges']));
     }
+
+    private function scanRangeId(array $range): string
+    {
+        return $range['id'] ?? substr(hash('sha256', $range['start'] . ':' . $range['end']), 0, 16);
+    }
+
+    private function scanRangeRunning(array $range): bool
+    {
+        $active = $this->state['live']['active'] ?? [];
+        if (($active['purpose'] ?? '') !== 'scan') { return false; }
+        $address = ip2long($active['ip']);
+        return $address >= $range['start'] && $address <= $range['end'];
+    }
     private function scanStatus(): string
     {
         $s = $this->state['scan']; $l = $this->state['live'];
         $active = $l['active'] ? $l['active']['ip'] . ' / ' . $l['active']['purpose'] : 'ندارد';
-        return ($s['paused'] ? '⏸ اسکن متوقف' : '🔎 اسکن فعال') . "\nدر حال تست: {$active}\nتست‌شده: {$s['tested']} | تمیز: {$s['passed']} | رد/نامشخص: {$s['failed']} | ردشده بدون تست: {$s['skipped']}"
+        return ($s['paused'] ? '⏸ اسکن متوقف' : '🔎 اسکن فعال') . "\nدر حال تست: {$active}\nمجموع تاریخچهٔ اسکن • تست‌شده: {$s['tested']} | پذیرفته: {$s['passed']} | رد/نامشخص: {$s['failed']} | ردشده بدون تست: {$s['skipped']}"
             . "\nباقی‌مانده: " . $this->scanRemaining() . "\nمخزن آماده: " . $this->readyCount()
             . "\nمصرف اعلام‌شده API در آخرین خواندن: {$l['observed_used']}/{$l['limit']}"
             . "\n" . ($l['blocked_until'] > time() ? 'در انتظار بازشدن سهمیه/رفع خطای API' : 'شروع تست‌ها با فاصله حداقل ۱۰ ثانیه و رعایت سقف ساعتی');
@@ -165,14 +212,17 @@ trait LiveOperations
         if (!$parts || count($parts) > $this->config['scan_max_ranges']) { return 'یک رنج مثل 104.16.0.0/24 یا 104.16.0.1-104.16.0.20 وارد کنید.'; }
         try { $ranges = array_map(fn($p) => IPv4Range::parse($p, $this->config['scan_max_addresses']), $parts); }
         catch (InvalidArgumentException $e) { return 'رنج نامعتبر است؛ IPv4 عمومی، ترتیب صحیح و حداکثر ' . $this->config['scan_max_addresses'] . ' آدرس در هر رنج لازم است.'; }
-        $existing = array_values(array_filter($this->state['scan']['ranges'], fn($r) => $r['next'] <= $r['end']));
+        $existing = $this->state['scan']['ranges'];
         foreach ($ranges as $r) {
             foreach ($existing as $old) {
-                if (max($r['start'], $old['start']) <= min($r['end'], $old['end'])) { return 'این رنج با یکی از رنج‌های صف هم‌پوشانی دارد.'; }
+                if (max($r['start'], $old['start']) <= min($r['end'], $old['end'])) {
+                    return 'این رنج با یکی از رنج‌های ثبت‌شده هم‌پوشانی دارد. برای اجرای دوباره یا حذف، «مدیریت رنج‌ها» را باز کنید.';
+                }
             }
+            $r['id'] = bin2hex(random_bytes(8));
             $existing[] = $r;
         }
-        if (count($existing) > $this->config['scan_max_ranges']) { return 'تعداد رنج‌های صف به سقف رسیده است.'; }
+        if (count($existing) > $this->config['scan_max_ranges']) { return 'تعداد رنج‌ها به سقف رسیده است. از «مدیریت رنج‌ها» موارد قدیمی را حذف کنید.'; }
         $this->state['scan']['ranges'] = $existing;
         $this->state['scan']['paused'] = false; $this->state['scan']['completion_reported'] = false;
         return '✅ رنج به صف اسکن اضافه شد.';
@@ -229,13 +279,23 @@ trait LiveOperations
             $verdict = LiveVerdict::Inconclusive;
             $reason = 'قالب کانفیگ هنگام تست تغییر کرد';
         }
-        $passed = $verdict === LiveVerdict::Green;
+        $passed = in_array($verdict, [LiveVerdict::Green, LiveVerdict::GreenWithDownloadError], true);
+        $group = $verdict === LiveVerdict::GreenWithDownloadError ? 'fallback' : 'complete';
+        $downloadLabel = $group === 'fallback' ? 'گروه ذخیره · خطای تست دانلود' : 'دانلود تأییدشده';
         $pending = $domain ? ($this->state['targets'][$domain]['pending'] ?? null) : null;
         if ($purpose === 'preflight' && $pending && $pending['new'] === $ip) {
             if ($passed) {
-                $this->state['targets'][$domain]['pending']['proof'] = ['ip' => $ip, 'passed_at' => $now,
-                    'job_id' => $active['job_id'], 'template_hash' => $this->templateHash()];
-                $this->queue("✅ تست نهایی {$ip} برای {$domain}: هر چهار نت سبز. در انتظار تأیید تازه خرابی و تغییر DNS.\nمخزن آماده: " . $this->readyCount());
+                $this->state['pool'][$ip]['download_group'] = $group;
+                $this->state['pool'][$ip]['verified_at'] = $now;
+                if ($group === 'fallback' && $pending['attempts'] === 0 && $this->poolCandidate(completeOnly: true) !== null) {
+                    $this->state['pool'][$ip]['status'] = 'available';
+                    $this->state['targets'][$domain]['pending'] = null;
+                    $this->queue("↪️ {$ip} در گروه ذخیره ماند. برای {$domain} ابتدا IP دارای دانلود تأییدشده بررسی می‌شود.");
+                } else {
+                    $this->state['targets'][$domain]['pending']['proof'] = ['ip' => $ip, 'passed_at' => $now,
+                        'job_id' => $active['job_id'], 'template_hash' => $this->templateHash(), 'download_group' => $group];
+                    $this->queue("✅ تست نهایی {$ip} برای {$domain}: هر چهار نود سبز · {$downloadLabel}. در انتظار تأیید تازهٔ خرابی.");
+                }
             } elseif ($verdict === LiveVerdict::Inconclusive) {
                 $this->deferPreflight($active, $now, 60);
                 $this->alert('live-final-inconclusive', "⏳ تست نهایی {$ip} نتیجهٔ قطعی نداشت. {$reason}\nIP در مخزن حفظ شد و ربات بعداً دوباره تلاش می‌کند.");
@@ -255,8 +315,9 @@ trait LiveOperations
                 // Do not overwrite a reservation or a domain assigned externally during a job.
                 $status = $this->state['pool'][$ip]['status'] ?? '';
                 if (in_array($status, ['', 'testing'], true) && !in_array($ip, array_column($this->state['targets'], 'current_ip'), true)) {
-                    $this->state['pool'][$ip] = ['status' => 'available', 'added_at' => $now, 'verified_at' => $now, 'via' => 'live-four-workers'];
-                    $this->queue("💎 IP تمیز شناسایی شد: {$ip}\nچهار نت سبز | یک راند | upload/download/jitter\nموجودی آماده مخزن: " . $this->readyCount());
+                    $this->state['pool'][$ip] = ['status' => 'available', 'added_at' => $now, 'verified_at' => $now,
+                        'via' => 'live-four-workers', 'download_group' => $group];
+                    $this->queue("💎 IP به مخزن اضافه شد: {$ip}\nچهار نود سبز · {$downloadLabel}\nموجودی آمادهٔ مخزن: " . $this->readyCount());
                 } elseif ($status === 'testing' && in_array($ip, array_column($this->state['targets'], 'current_ip'), true)) {
                     $this->state['pool'][$ip]['status'] = 'used';
                 }

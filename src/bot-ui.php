@@ -152,6 +152,10 @@ trait BotUi
             }
             return;
         }
+        if (preg_match('/^range-(view|restart|remove|confirm-restart|confirm-remove):([a-f0-9]{16})$/D', $action, $match)) {
+            $this->scanRangeAction($match[1], $match[2], $message);
+            return;
+        }
         if ($action === 'probe-direct' || $action === 'probe-current') {
             $proxy = $action === 'probe-direct' ? null : $this->selectedProxy();
             [$report] = $this->probeConnection($proxy);
@@ -202,10 +206,21 @@ trait BotUi
                 break;
             case 'scan':
                 $text = "🔎 اسکن IP\n\n" . $this->scanStatus();
-                array_unshift($rows, [['➕ افزودن رنج', 'input-scan']], [
+                array_unshift($rows, [['➕ افزودن رنج', 'input-scan'], ['📋 مدیریت رنج‌ها', 'scan-ranges']], [
                     $this->state['scan']['paused'] ? ['▶️ ادامهٔ اسکن', 'scan-resume'] : ['⏸ توقف اسکن', 'scan-stop'],
                     ['🔄 تازه‌سازی', 'scan'],
                 ], [['🔌 اتصال API', 'connection']]);
+                break;
+            case 'scan-ranges':
+                $ranges = $this->state['scan']['ranges'];
+                $text = $ranges ? '📋 مدیریت رنج‌ها' . "\n\n" . 'برای دیدن پیشرفت، شروع از ابتدا یا حذف، یک رنج انتخاب کنید.'
+                    : 'هنوز رنجی برای اسکن ثبت نشده است.';
+                $rows = [];
+                foreach ($ranges as $range) {
+                    $badge = $this->scanRangeRunning($range) ? '🔎' : ($range['next'] > $range['end'] ? '✓' : ($this->state['scan']['paused'] ? '⏸' : '⏳'));
+                    $rows[] = [[$badge . ' ' . $range['label'], 'range-view:' . $this->scanRangeId($range)]];
+                }
+                $rows[] = [['➕ افزودن رنج', 'input-scan'], ['↩️ اسکن', 'scan']];
                 break;
             case 'pool':
                 $text = "📦 مخزن IP\n\n" . $this->executeCommand('/pool', []);
@@ -283,6 +298,59 @@ trait BotUi
         if ($nav) { $rows[] = $nav; }
         $rows[] = [['↩️ مخزن IP', 'pool']];
         return $rows;
+    }
+
+    private function scanRangeAction(string $action, string $id, array $message): void
+    {
+        $ranges = &$this->state['scan']['ranges'];
+        $index = null;
+        foreach ($ranges as $i => $range) {
+            if ($this->scanRangeId($range) === $id) { $index = $i; break; }
+        }
+        if ($index === null) {
+            $this->showMenu('scan-ranges', $message, 'این رنج دیگر در فهرست نیست.');
+            return;
+        }
+        $range = $ranges[$index];
+        $running = $this->scanRangeRunning($range);
+        $back = [['↩️ فهرست رنج‌ها', 'scan-ranges']];
+        if ($action === 'view' || $running) {
+            $size = $range['end'] - $range['start'] + 1;
+            $visited = max(0, min($size, $range['next'] - $range['start']));
+            $next = $visited < $size ? "\nIP بعدی: " . long2ip($range['next']) : "\n🏁 رنج کامل شده است.";
+            $text = $range['label'] . "\n\nپیشرفت این دور: {$visited} از {$size}" . $next;
+            $rows = [];
+            if ($running) {
+                $text .= "\n\nیک تست از همین رنج در حال اجراست. پس از پایان تست می‌توانید رنج را حذف کنید یا از ابتدا شروع کنید.";
+                $rows[] = [['🔄 تازه‌سازی', 'range-view:' . $id]];
+            } else {
+                $rows[] = [['🔁 شروع از ابتدا', 'range-restart:' . $id], ['🗑 حذف رنج', 'range-remove:' . $id]];
+            }
+            $rows[] = $back;
+            $this->screen($text, $rows, $message);
+            return;
+        }
+        if ($action === 'restart' || $action === 'remove') {
+            $restart = $action === 'restart';
+            $prompt = $restart ? 'این رنج به ابتدای صف برمی‌گردد و اسکن فعال می‌شود. IPهای ثبت‌شده در مخزن بررسی دوباره نمی‌شوند.'
+                : 'این رنج از فهرست اسکن حذف می‌شود. IPهایی که از آن وارد مخزن شده‌اند، در مخزن می‌مانند.';
+            $this->screen($range['label'] . "\n\n" . $prompt, [
+                [[($restart ? '✅ شروع دوباره' : 'حذف از صف'), 'range-confirm-' . $action . ':' . $id]],
+                [['انصراف', 'range-view:' . $id]],
+            ], $message);
+            return;
+        }
+        array_splice($ranges, $index, 1);
+        if ($action === 'confirm-restart') {
+            $range['next'] = $range['start'];
+            array_unshift($ranges, $range);
+            $this->state['scan']['paused'] = false;
+            $this->state['scan']['completion_reported'] = false;
+            $this->showMenu('scan-ranges', $message, '✅ این رنج برای اسکن از ابتدا به اول صف منتقل شد.');
+        } else {
+            if ($this->scanRemaining() === 0) { $this->state['scan']['paused'] = true; }
+            $this->showMenu('scan-ranges', $message, '✅ رنج از فهرست حذف شد.');
+        }
     }
 
     private function poolIPProtected(string $ip): bool

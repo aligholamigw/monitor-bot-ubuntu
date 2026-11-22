@@ -228,11 +228,21 @@ final class App
                 unset($this->state['pool'][$ip]); $reply = 'IP از مخزن آماده حذف شد.'; break;
             case '/pool':
                 $counts = array_count_values(array_column($this->state['pool'], 'status'));
-                $reply = 'مخزن: آماده ' . ($counts['available'] ?? 0) . ' | رزرو ' . ($counts['reserved'] ?? 0)
-                    . ' | در حال تست ' . ($counts['testing'] ?? 0) . ' | ردشده ' . ($counts['rejected'] ?? 0)
-                    . ' | مصرف‌شده/بازنشسته ' . (($counts['used'] ?? 0) + ($counts['retired'] ?? 0));
-                $ips = array_keys(array_filter($this->state['pool'], fn($p) => $p['status'] === 'available'));
-                $reply .= "\n" . implode("\n", array_slice($ips, 0, 60)); break;
+                $groups = ['complete' => [], 'unknown' => [], 'fallback' => []];
+                foreach ($this->state['pool'] as $ip => $entry) {
+                    if ($entry['status'] === 'available') { $groups[$this->poolDownloadGroup($entry)][] = $ip; }
+                }
+                $reply = 'آماده ' . ($counts['available'] ?? 0) . ' · رزرو ' . ($counts['reserved'] ?? 0)
+                    . ' · در حال تست ' . ($counts['testing'] ?? 0) . ' · ردشده ' . ($counts['rejected'] ?? 0)
+                    . ' · مصرف‌شده/بازنشسته ' . (($counts['used'] ?? 0) + ($counts['retired'] ?? 0));
+                foreach (['complete' => '🟢 دانلود تأییدشده · اولویت اول', 'unknown' => '⚪ وضعیت دانلود نامشخص',
+                    'fallback' => '🟡 گروه ذخیره · خطای تست دانلود'] as $group => $label) {
+                    $ips = $groups[$group];
+                    $reply .= "\n\n{$label} (" . count($ips) . ')';
+                    if ($ips) { $reply .= "\n" . implode("\n", array_slice($ips, 0, 15)); }
+                    if (count($ips) > 15) { $reply .= "\n… و " . (count($ips) - 15) . ' IP دیگر'; }
+                }
+                break;
             case '/threshold':
                 if (!in_array($parts[0] ?? '', ['2', '3'], true)) { $reply = 'آستانه را از دکمه‌های ۲ یا ۳ نتیجهٔ قرمز انتخاب کنید.'; break; }
                 $this->state['threshold'] = (int)$parts[0];
@@ -336,6 +346,13 @@ final class App
             $this->alert('pending-' . $domain, "⚠️ تأیید تغییر DNS برای {$domain} معلق است. IP رزرو باقی مانده و گزینهٔ تلاش دوباره در «تعویض DNS» در دسترس است."); return;
         }
         if (($this->config['require_live_preflight'] ?? true) && !$this->proofFresh($domain, $now)) { return; }
+        if ($p['attempts'] === 0 && ($p['proof']['download_group'] ?? '') === 'fallback'
+            && $this->poolCandidate(completeOnly: true) !== null) {
+            $this->state['pool'][$p['new']]['status'] = 'available';
+            $t['pending'] = null;
+            $this->save();
+            return;
+        }
         $t['pending']['attempts']++; $this->save();
         try {
             $this->api->patch($p['record_id'], $p['new']);
@@ -461,15 +478,7 @@ final class App
             if (empty($dns[$domain]['proxied']) && ($c['entry_ip'] ?? '') !== $dns[$domain]['content']) {
                 $this->alert('resolve-' . $domain, "⚠️ IP ثبت‌شده در مانیتورینگ با DNS فعلی {$domain} متفاوت است؛ تعویض بعدی متوقف شد."); continue;
             }
-            $blocked = array_merge(array_column($dns, 'content'), $simulated);
-            if (!empty($this->state['live']['active'])) { $blocked[] = $this->state['live']['active']['ip']; }
-            foreach ($this->state['targets'] as $other) {
-                if (!empty($other['pending'])) { $blocked[] = $other['pending']['new']; $blocked[] = $other['pending']['old']; }
-            }
-            $candidate = null;
-            foreach ($this->state['pool'] as $ip => $p) {
-                if ($p['status'] === 'available' && !in_array($ip, $blocked, true)) { $candidate = $ip; break; }
-            }
+            $candidate = $this->poolCandidate(array_merge(array_column($dns, 'content'), $simulated));
             if ($candidate === null) { $this->alert('no-ip', "⛔ IP آماده و متفاوت برای {$domain} موجود نیست. از «مخزن IP» یا «اسکن» استفاده کنید."); continue; }
             $reason = implode(', ', $trigger) . ' / ' . $this->state['threshold'] . ' قرمز متوالی';
             if ($this->state['dry_run']) {
