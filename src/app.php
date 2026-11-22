@@ -222,19 +222,6 @@ final class App
         switch ($cmd) {
             case '/scan': case '/scanstatus': case '/scanstop': case '/scanresume':
                 $reply = $this->scanCommand($cmd, $parts); break;
-            case '/add':
-                $ips = array_values(array_unique($parts));
-                if (!$ips || count($ips) > 100 || array_filter($ips, fn($ip) => !self::publicIPv4($ip))) {
-                    $reply = 'همهٔ ورودی‌ها باید IPv4 عمومی باشند. حداکثر ۱۰۰ آدرس را با فاصله یا سطر جدید جدا کنید.'; break;
-                }
-                $added = 0;
-                foreach ($ips as $ip) {
-                    $current = array_column($this->state['targets'], 'current_ip');
-                    if (isset($this->state['pool'][$ip]) || in_array($ip, $current, true)) { continue; }
-                    $this->state['pool'][$ip] = ['status' => 'available', 'added_at' => time()]; $added++;
-                }
-                $reply = "✅ {$added} IP جدید اضافه شد. IP تکراری، مصرف‌شده یا در حال استفاده اضافه نمی‌شود.";
-                break;
             case '/remove':
                 $ip = $parts[0] ?? '';
                 if (($this->state['pool'][$ip]['status'] ?? '') !== 'available') { $reply = 'این IP در مخزن آماده نیست.'; break; }
@@ -270,7 +257,8 @@ final class App
                 $this->state['targets'][$domain]['pending']['attempts'] = 0;
                 $reply = 'در کرون بعدی همان IP رزروشده دوباره بررسی می‌شود.'; break;
             case '/status':
-                $reply = ($this->state['paused'] ? '⏸ متوقف' : '▶️ فعال') . ' | ' . ($this->state['dry_run'] ? 'شبیه‌سازی' : 'واقعی') . "\nآستانه: {$this->state['threshold']} | سیاست: {$this->config['operator_policy']}";
+                $policy = $this->config['operator_policy'] === 'all' ? 'هر دو نود' : 'یکی از دو نود';
+                $reply = ($this->state['paused'] ? '⏸ تعویض متوقف' : '▶️ تعویض فعال') . ' | ' . ($this->state['dry_run'] ? 'شبیه‌سازی' : 'واقعی') . "\nآستانهٔ خرابی: {$this->state['threshold']} نتیجهٔ قرمز متوالی روی {$policy}";
                 $lastRun = $this->state['last_run']
                     ? (new DateTimeImmutable('@' . $this->state['last_run']))->setTimezone(new DateTimeZone('Asia/Tehran'))->format('Y-m-d H:i:s') . ' (تهران)'
                     : 'دریافت موفق ثبت نشده';
@@ -281,8 +269,19 @@ final class App
                         ? ($t['pending']['attempts'] === 0 ? ' [در انتظار تست نهایی/تغییر]' : ' [پاسخ DNS در انتظار تطبیق]') : '');
                     foreach ($this->config['workers'] as $worker) {
                         $s = $t['samples'][$worker] ?? [];
-                        $reply .= "\n{$worker}: " . ($s['status'] ?? 'بدون داده') . ' | قرمز متوالی: ' . ($s['count'] ?? 0)
-                            . ' | سن نتیجه: ' . (isset($s['ts']) ? max(0, time() - $s['ts']) . 's' : '—');
+                        $age = isset($s['ts']) ? max(0, time() - $s['ts']) : null;
+                        $status = $s['status'] ?? '';
+                        $fresh = $age !== null && $age <= $this->config['max_sample_age'];
+                        $red = $fresh && in_array($status, $this->config['red_statuses'], true);
+                        $indicator = match (true) {
+                            $red => '🔴 قطع اتصال',
+                            $fresh && $status === 'ok' => '🟢 وصل',
+                            $fresh && $status === 'weak' => '⚪ کند',
+                            default => '⚪ بدون نتیجهٔ تازه',
+                        };
+                        $reply .= "\n{$indicator} · " . strtoupper($worker)
+                            . ($red ? ' · ' . ($s['count'] ?? 0) . ' قرمز متوالی' : '')
+                            . ($age !== null ? " · {$age} ثانیه قبل" : '');
                     }
                 } break;
             default: $reply = 'از منوی اصلی یک گزینه را انتخاب کنید.';
@@ -456,6 +455,8 @@ final class App
                 $dns[$domain]['content'] = $t['current_ip'];
                 continue;
             }
+            if (!$this->state['dry_run'] && $now < $this->state['live']['blocked_until']
+                && !($this->state['live']['scan_quota_wait'] ?? false)) { continue; }
             // For DNS-only records, wait for monitoring's address cache to catch up.
             if (empty($dns[$domain]['proxied']) && ($c['entry_ip'] ?? '') !== $dns[$domain]['content']) {
                 $this->alert('resolve-' . $domain, "⚠️ IP ثبت‌شده در مانیتورینگ با DNS فعلی {$domain} متفاوت است؛ تعویض بعدی متوقف شد."); continue;

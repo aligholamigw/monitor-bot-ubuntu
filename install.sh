@@ -70,24 +70,29 @@ run_check() {
     runuser -u monitorbot -- env MONITOR_BOT_CONFIG="$config_dir/config.php" /usr/bin/php "$1" "$2"
 }
 
-# Let the service user validate even when the checkout is under /root.
-stage=$(mktemp -d /tmp/monitor-bot.XXXXXXXX)
-cleanup() {
-    rm -f -- "$stage/deploy/server-check.php" "$stage"/src/*.php
-    rmdir -- "$stage/deploy" "$stage/src" "$stage" 2>/dev/null || true
-}
-trap cleanup EXIT
-chmod 0755 "$stage"
-install -d -m 0755 "$stage/src" "$stage/deploy"
-install -m 0644 "$source_dir"/src/*.php "$stage/src/"
-install -m 0644 "$source_dir/deploy/server-check.php" "$stage/deploy/"
-
 check_status=0
-run_check "$stage/deploy/server-check.php" check || check_status=$?
-if ((check_status == 12)); then
-    ((switch_webhook == 1)) || exit 12
-elif ((check_status != 0)); then
-    exit "$check_status"
+if [[ -f "$cron_file" && -f "$unit_file" && -z "$import_state" && "$switch_webhook" == 0 ]]; then
+    # An API outage must not block applying a fix to an existing installation.
+    /usr/bin/php -l "$config_dir/config.php" >/dev/null
+    printf '%s\n' 'Updating existing Monitor Bot with its current settings and state.'
+else
+    # Let the service user validate even when the checkout is under /root.
+    stage=$(mktemp -d /tmp/monitor-bot.XXXXXXXX)
+    cleanup() {
+        rm -f -- "$stage/deploy/server-check.php" "$stage"/src/*.php
+        rmdir -- "$stage/deploy" "$stage/src" "$stage" 2>/dev/null || true
+    }
+    trap cleanup EXIT
+    chmod 0755 "$stage"
+    install -d -m 0755 "$stage/src" "$stage/deploy"
+    install -m 0644 "$source_dir"/src/*.php "$stage/src/"
+    install -m 0644 "$source_dir/deploy/server-check.php" "$stage/deploy/"
+    run_check "$stage/deploy/server-check.php" check || check_status=$?
+    if ((check_status == 12)); then
+        ((switch_webhook == 1)) || exit 12
+    elif ((check_status != 0)); then
+        exit "$check_status"
+    fi
 fi
 
 if [[ -n "$import_state" ]]; then

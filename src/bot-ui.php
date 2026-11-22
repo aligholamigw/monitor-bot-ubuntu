@@ -89,7 +89,11 @@ trait BotUi
             return;
         }
         unset($this->state['ui']['input']);
-        $legacy = ['/scan' => 'scan', '/scanstop' => 'scan', '/scanresume' => 'scan', '/add' => 'pool',
+        if ($cmd === '/add') {
+            $this->addPoolIPs($parts);
+            return;
+        }
+        $legacy = ['/scan' => 'scan', '/scanstop' => 'scan', '/scanresume' => 'scan',
             '/remove' => 'pool', '/threshold' => 'dns', '/pause' => 'dns', '/resume' => 'dns',
             '/dryrun' => 'dns', '/live' => 'dns', '/retry' => 'dns'];
         if (isset($legacy[$cmd])) {
@@ -107,6 +111,11 @@ trait BotUi
             'input-proxy' => ['connection', "آدرس SOCKS5 مورد اعتماد را با پورت بفرستید.\nقالب: socks5h://proxy.example.com:1080\nبرای پروکسی دارای رمز، از فایل خصوصی config.php استفاده کنید."],
         ];
         unset($this->state['ui']['input']);
+        if (preg_match('/^pool-(confirm|cancel):([a-f0-9]{16})$/D', $action, $match)) {
+            $this->confirmPoolIPs($match[1] === 'confirm', $match[2], $message);
+            return;
+        }
+        unset($this->state['ui']['pool_confirmation']);
         if (isset($prompts[$action])) {
             [$back, $text] = $prompts[$action];
             $this->state['ui']['input'] = ['action' => $action, 'back' => $back, 'expires' => time() + 600];
@@ -173,8 +182,12 @@ trait BotUi
             return;
         }
         $parts = preg_split('/[\s,،]+/u', $text, -1, PREG_SPLIT_NO_EMPTY);
-        $cmd = $input['action'] === 'input-scan' ? '/scan' : '/add';
-        $reply = $this->executeCommand($cmd, $parts);
+        unset($this->state['ui']['input']);
+        if ($input['action'] === 'input-add') {
+            $this->addPoolIPs($parts);
+            return;
+        }
+        $reply = $this->executeCommand('/scan', $parts);
         $this->showMenu($input['back'], [], $reply);
     }
 
@@ -184,7 +197,7 @@ trait BotUi
         $rows = [$home];
         switch ($page) {
             case 'status':
-                $text = "📊 وضعیت دامنه‌ها\n\n" . $this->executeCommand('/status', []);
+                $text = "📊 وضعیت دامنه‌ها\n🟢 وصل   🔴 قطع   ⚪ کند یا بدون تست تازه\n\n" . $this->executeCommand('/status', []);
                 array_unshift($rows, [['🔄 تازه‌سازی', 'status'], ['🔌 اتصال API', 'connection']]);
                 break;
             case 'scan':
@@ -199,13 +212,22 @@ trait BotUi
                 array_unshift($rows, [['➕ افزودن IP', 'input-add'], ['➖ حذف IP', 'remove']]);
                 break;
             case 'dns':
-                $mode = $this->state['dry_run'] ? 'شبیه‌سازی' : 'واقعی';
+                $mode = $this->state['dry_run'] ? '🧪 شبیه‌سازی' : '⚡ واقعی';
                 $running = $this->state['paused'] ? 'متوقف' : 'فعال';
-                $text = "⚙️ تعویض DNS\n\nحالت {$mode} • تعویض {$running}\nآستانهٔ خرابی {$this->state['threshold']} تست مستقل قرمز";
+                $threshold = $this->state['threshold'];
+                $text = "⚙️ تنظیمات تعویض DNS\n\n{$mode} · تعویض {$running}\n"
+                    . "آستانه: {$threshold} تست مستقل قرمزِ متوالی\n\n"
+                    . "🧪 شبیه‌سازی: خرابی و IP پیشنهادی را گزارش می‌دهد. رکورد Cloudflare و موجودی مخزن تغییر نمی‌کنند.\n"
+                    . "⚡ واقعی: پس از خرابی تأییدشده، IP جایگزین را روی چهار نود تست می‌کند و با نتیجهٔ سبز DNS را تغییر می‌دهد.\n"
+                    . "⏸ توقف تعویض: پایش و اسکن ادامه دارند. برای تعویض دوباره «ادامهٔ تعویض» را بزنید.";
                 array_unshift($rows, [
+                    $this->state['dry_run'] ? ['⚡ انتخاب حالت واقعی', 'dns-live'] : ['🧪 انتخاب شبیه‌سازی', 'dns-dry'],
+                ], [
                     $this->state['paused'] ? ['▶️ ادامهٔ تعویض', 'dns-resume'] : ['⏸ توقف تعویض', 'dns-pause'],
-                    $this->state['dry_run'] ? ['حالت واقعی', 'dns-live'] : ['شبیه‌سازی', 'dns-dry'],
-                ], [['۲ نتیجهٔ قرمز', 'threshold-2'], ['۳ نتیجهٔ قرمز', 'threshold-3']]);
+                ], [
+                    [($threshold === 2 ? '✓ ' : '') . 'آستانهٔ ۲ قرمز', 'threshold-2'],
+                    [($threshold === 3 ? '✓ ' : '') . 'آستانهٔ ۳ قرمز', 'threshold-3'],
+                ]);
                 foreach ($this->config['domains'] as $index => $domain) {
                     if (!empty($this->state['targets'][$domain]['pending'])) {
                         array_unshift($rows, [['تلاش دوبارهٔ ' . $domain, 'retry-' . $index]]);
@@ -261,6 +283,65 @@ trait BotUi
         if ($nav) { $rows[] = $nav; }
         $rows[] = [['↩️ مخزن IP', 'pool']];
         return $rows;
+    }
+
+    private function poolIPProtected(string $ip): bool
+    {
+        $entry = $this->state['pool'][$ip] ?? [];
+        if (in_array($entry['status'] ?? '', ['reserved', 'testing'], true) || ($this->state['live']['active']['ip'] ?? '') === $ip) { return true; }
+        foreach ($this->state['targets'] as $target) {
+            if (in_array($ip, [$target['current_ip'] ?? null, $target['pending']['old'] ?? null, $target['pending']['new'] ?? null], true)) { return true; }
+        }
+        return false;
+    }
+
+    private function addPoolIPs(array $parts): void
+    {
+        unset($this->state['ui']['pool_confirmation']);
+        $ips = array_values(array_unique($parts));
+        if (!$ips || count($ips) > 100 || array_filter($ips, fn($ip) => !self::publicIPv4($ip))) {
+            $this->showMenu('pool', [], 'حداکثر ۱۰۰ آدرس IPv4 عمومی را با فاصله یا سطر جدید بفرستید.');
+            return;
+        }
+        $duplicates = [];
+        $added = 0;
+        $protected = 0;
+        foreach ($ips as $ip) {
+            if ($this->poolIPProtected($ip)) { $protected++; continue; }
+            if (isset($this->state['pool'][$ip])) { $duplicates[] = $ip; continue; }
+            $this->state['pool'][$ip] = ['status' => 'available', 'added_at' => time()];
+            $added++;
+        }
+        $summary = "{$added} IP جدید اضافه شد." . ($protected ? "\n{$protected} IP در حال استفاده، تست یا رزرو بود." : '');
+        if (!$duplicates) { $this->showMenu('pool', [], $summary); return; }
+        $token = bin2hex(random_bytes(8));
+        $this->state['ui']['pool_confirmation'] = ['token' => $token, 'ips' => $duplicates, 'expires' => time() + 600];
+        $list = implode("\n", array_slice($duplicates, 0, 20));
+        if (count($duplicates) > 20) { $list .= "\n… و " . (count($duplicates) - 20) . ' مورد دیگر'; }
+        $this->screen($summary . "\n\n" . count($duplicates) . " IP قبلاً ثبت شده‌اند. با تأیید، IPهای قابل‌استفاده دوباره آماده می‌شوند و هر آدرس فقط یک بار در مخزن می‌ماند.\n\n" . $list,
+            [[['✅ تأیید افزودن دوباره', 'pool-confirm:' . $token]], [['انصراف', 'pool-cancel:' . $token]]]);
+    }
+
+    private function confirmPoolIPs(bool $confirm, string $token, array $message): void
+    {
+        $request = $this->state['ui']['pool_confirmation'] ?? [];
+        if (($request['token'] ?? '') !== $token || ($request['expires'] ?? 0) <= time()) {
+            $this->showMenu('pool', $message, 'این تأیید منقضی شده است. آدرس را دوباره بفرستید.');
+            return;
+        }
+        unset($this->state['ui']['pool_confirmation']);
+        if (!$confirm) { $this->showMenu('pool', $message, 'افزودن دوباره لغو شد.'); return; }
+        $restored = 0;
+        $already = 0;
+        foreach ($request['ips'] as $ip) {
+            if ($this->poolIPProtected($ip)) { continue; }
+            if (($this->state['pool'][$ip]['status'] ?? '') === 'available') { $already++; continue; }
+            $this->state['pool'][$ip] = ['status' => 'available', 'added_at' => time()];
+            $restored++;
+        }
+        $skipped = count($request['ips']) - $restored - $already;
+        $this->showMenu('pool', $message, "✅ {$restored} IP دوباره آماده شد. {$already} IP از قبل آماده بود."
+            . ($skipped ? " {$skipped} IP به دلیل استفاده یا رزرو قابل بازگردانی نبود." : ''));
     }
 
     public static function normalizeProxy(string $value, bool $allowCredentials = false): ?string

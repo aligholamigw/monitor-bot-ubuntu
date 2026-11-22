@@ -26,6 +26,14 @@ sudo bash install.sh --switch-webhook --state /path/to/state.json
 
 ## فایل‌ها و بررسی اجرا
 
+برای به‌روزرسانی، از پوشهٔ مخزن اجرا کنید:
+
+```bash
+git pull --ff-only && sudo bash install.sh
+```
+
+به‌روزرسانی تنظیمات خصوصی، صف و مخزن را حفظ می‌کند و سرویس تلگرام را دوباره راه می‌اندازد.
+
 | کاربرد | مسیر یا فرمان |
 |---|---|
 | برنامه | `/opt/monitor-bot` |

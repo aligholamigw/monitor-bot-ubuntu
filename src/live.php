@@ -39,34 +39,62 @@ final class VlessTemplate
     }
 }
 
+enum LiveVerdict
+{
+    case Green;
+    case Unsuitable;
+    case Inconclusive;
+}
+
 final class LiveResult
 {
     public static function green(array $job, array $active, array $workers, array $checks, int $now, int $timeout): bool
     {
+        return self::verdict($job, $active, $workers, $checks, $now, $timeout) === LiveVerdict::Green;
+    }
+
+    public static function verdict(array $job, array $active, array $workers, array $checks, int $now, int $timeout): LiveVerdict
+    {
         if (($job['status'] ?? '') !== 'done' || (string)($job['id'] ?? '') !== (string)$active['job_id']
             || ($job['workers_done'] ?? 0) !== count($workers) || ($job['workers_total'] ?? 0) !== count($workers)
             || ($job['rounds'] ?? 0) !== 1 || (int)($job['created'] ?? 0) < $active['created_at'] - 30
-            || (int)($job['created'] ?? 0) > $now + 30 || $now - $active['created_at'] > $timeout) { return false; }
+            || (int)($job['created'] ?? 0) > $now + 30 || $now - $active['created_at'] > $timeout) { return LiveVerdict::Inconclusive; }
         $actualWorkers = $job['worker_ids'] ?? []; $expected = $workers;
+        if (!is_array($actualWorkers)) { return LiveVerdict::Inconclusive; }
         sort($actualWorkers); sort($expected);
-        if ($actualWorkers !== $expected) { return false; }
-        foreach ($checks as $check) { if (!in_array($check, $job['checks'] ?? [], true)) { return false; } }
+        if ($actualWorkers !== $expected || !is_array($job['checks'] ?? null)
+            || array_diff($checks, $job['checks'])) { return LiveVerdict::Inconclusive; }
         $results = $job['results'] ?? [];
-        if (count($results) !== count($workers)) { return false; }
+        if (!is_array($results) || count($results) !== count($workers)) { return LiveVerdict::Inconclusive; }
         $seen = [];
+        $unsuitable = false;
         foreach ($results as $r) {
             $worker = $r['worker_id'] ?? '';
-            if (!in_array($worker, $workers, true) || isset($seen[$worker]) || ($r['summary'] ?? '') !== 'ok'
+            if (!in_array($worker, $workers, true) || isset($seen[$worker])
                 || ($r['round'] ?? 0) !== 1 || ($r['config']['address'] ?? '') !== $active['ip']
                 || ($r['config']['name'] ?? '') !== $active['tag'] || ($r['config']['protocol'] ?? '') !== 'vless'
                 || (int)($r['config']['port'] ?? 0) !== (int)$active['port']
-                || ($job['claims'][$worker]['status'] ?? '') !== 'done') { return false; }
+                || ($job['claims'][$worker]['status'] ?? '') !== 'done') { return LiveVerdict::Inconclusive; }
             $seen[$worker] = true;
             $byCheck = [];
+            $explicitFailure = false;
             foreach ($r['checks'] ?? [] as $c) {
-                if (isset($byCheck[$c['name'] ?? ''])) { return false; }
+                if (isset($byCheck[$c['name'] ?? ''])) { return LiveVerdict::Inconclusive; }
                 $byCheck[$c['name'] ?? ''] = $c;
+                if (preg_match('/\b429\b|rate.limit|quota|worker.offline|limit.exceeded|job.expired/i', (string)($c['detail'] ?? ''))) {
+                    return LiveVerdict::Inconclusive;
+                }
+                if (in_array($c['name'] ?? '', array_merge(['connect'], $checks), true)
+                    && in_array($c['status'] ?? '', ['down', 'blocked'], true)) { $explicitFailure = true; }
             }
+            $summary = $r['summary'] ?? '';
+            if (in_array($summary, ['down', 'blocked'], true)) {
+                // A real probe can stop after a failed check. A bare summary is not evidence.
+                if (!$explicitFailure || !isset($byCheck['connect'])) { return LiveVerdict::Inconclusive; }
+                $unsuitable = true;
+                continue;
+            }
+            if (!in_array($summary, ['ok', 'weak'], true)) { return LiveVerdict::Inconclusive; }
             foreach (array_merge(['connect'], $checks) as $name) {
                 $c = $byCheck[$name] ?? [];
                 // Match the dashboard's overall green. Weak throughput can coexist with
@@ -74,10 +102,11 @@ final class LiveResult
                 $allowed = $name === 'connect' ? ['ok'] : ['ok', 'weak'];
                 if (!in_array($c['status'] ?? '', $allowed, true) || !is_numeric($c['value'] ?? null)
                     || !is_finite((float)$c['value']) || (float)$c['value'] < 0
-                    || (in_array($name, ['upload', 'download'], true) && (float)$c['value'] <= 0)) { return false; }
+                    || (in_array($name, ['upload', 'download'], true) && (float)$c['value'] <= 0)) { return LiveVerdict::Inconclusive; }
             }
+            if ($summary === 'weak') { $unsuitable = true; }
         }
-        return count($seen) === count($workers);
+        return $unsuitable ? LiveVerdict::Unsuitable : LiveVerdict::Green;
     }
 }
 
@@ -174,17 +203,42 @@ trait LiveOperations
         }
         unset($range);
     }
-    private function liveFinished(bool $passed, int $now, string $reason): void
+    private function deferPreflight(array $intent, int $now, int $delay): void
+    {
+        $live = &$this->state['live'];
+        $live['blocked_until'] = max($live['blocked_until'], $now + $delay);
+        $live['scan_quota_wait'] = false;
+        if ($intent['purpose'] !== 'preflight') { return; }
+        $target = &$this->state['targets'][$intent['domain']];
+        if (($target['pending']['new'] ?? null) !== $intent['ip']) { return; }
+        if ($target['pending']['attempts'] === 0) {
+            $this->state['pool'][$intent['ip']]['status'] = 'available';
+            $target['pending'] = null;
+        } else {
+            // Keep the reservation while a previous DNS mutation may still be in flight.
+            $target['pending']['proof'] = null;
+            $target['pending']['live_retry_after'] = $now + $delay;
+        }
+    }
+
+    private function liveFinished(LiveVerdict $verdict, int $now, string $reason): void
     {
         $active = $this->state['live']['active']; if (!$active) { return; }
         $ip = $active['ip']; $purpose = $active['purpose']; $domain = $active['domain'] ?? null;
-        if (($active['template_hash'] ?? '') !== $this->templateHash()) { $passed = false; $reason = 'قالب کانفیگ هنگام تست تغییر کرد'; }
+        if (($active['template_hash'] ?? '') !== $this->templateHash()) {
+            $verdict = LiveVerdict::Inconclusive;
+            $reason = 'قالب کانفیگ هنگام تست تغییر کرد';
+        }
+        $passed = $verdict === LiveVerdict::Green;
         $pending = $domain ? ($this->state['targets'][$domain]['pending'] ?? null) : null;
         if ($purpose === 'preflight' && $pending && $pending['new'] === $ip) {
             if ($passed) {
                 $this->state['targets'][$domain]['pending']['proof'] = ['ip' => $ip, 'passed_at' => $now,
                     'job_id' => $active['job_id'], 'template_hash' => $this->templateHash()];
                 $this->queue("✅ تست نهایی {$ip} برای {$domain}: هر چهار نت سبز. در انتظار تأیید تازه خرابی و تغییر DNS.\nمخزن آماده: " . $this->readyCount());
+            } elseif ($verdict === LiveVerdict::Inconclusive) {
+                $this->deferPreflight($active, $now, 60);
+                $this->alert('live-final-inconclusive', "⏳ تست نهایی {$ip} نتیجهٔ قطعی نداشت. {$reason}\nIP در مخزن حفظ شد و ربات بعداً دوباره تلاش می‌کند.");
             } elseif ($pending['attempts'] === 0) {
                 $this->state['pool'][$ip]['status'] = 'rejected';
                 $this->state['targets'][$domain]['pending'] = null;
@@ -245,7 +299,7 @@ trait LiveOperations
             }
         }
         if ($now - $a['created_at'] > $this->config['live_job_timeout']) {
-            $this->liveFinished(false, $now, 'نتیجه ارسال API نامشخص ماند؛ تست تکراری فوری ایجاد نشد');
+            $this->liveFinished(LiveVerdict::Inconclusive, $now, 'نتیجهٔ ارسال درخواست نامشخص ماند.');
         }
     }
     public function liveStep(?int $clock = null): void
@@ -257,6 +311,10 @@ trait LiveOperations
         }
         $a = $this->state['live']['active'];
         if ($a) {
+            if ($now - $a['created_at'] > $this->config['live_job_timeout']) {
+                $this->liveFinished(LiveVerdict::Inconclusive, $now, 'مهلت تست لایو تمام شد.');
+                return;
+            }
             if ($now < ($a['poll_at'] ?? 0)) { return; }
             $this->state['live']['active']['poll_at'] = $now + 10;
             try {
@@ -265,15 +323,21 @@ trait LiveOperations
                 } else {
                     $job = $this->api->liveJob($a['job_id']);
                     if (($job['status'] ?? '') === 'done') {
-                        $green = LiveResult::green($job, $a, $this->config['live_workers'], $this->config['live_checks'], $now, $this->config['live_job_timeout']);
-                        $this->liveFinished($green, $now, 'نتیجه نهایی ناقص یا حداقل یک نود غیرسبز بود'); return;
+                        $verdict = LiveResult::verdict($job, $a, $this->config['live_workers'], $this->config['live_checks'], $now, $this->config['live_job_timeout']);
+                        $reason = $verdict === LiveVerdict::Unsuitable ? 'تست کامل بود و دست‌کم یک نود سبز نبود.' : 'نتیجهٔ معتبر و کامل دریافت نشد.';
+                        $this->liveFinished($verdict, $now, $reason);
+                        return;
                     }
                 }
             } catch (Throwable $e) {
-                if ($e instanceof HttpFailure && $e->status === 429) { $this->state['live']['active']['poll_at'] = $now + max(30, $e->retryAfter); }
+                if ($e instanceof HttpFailure && $e->status === 429) {
+                    $delay = max(60, $e->retryAfter);
+                    $this->state['live']['active']['poll_at'] = $now + $delay;
+                    $this->state['live']['blocked_until'] = max($this->state['live']['blocked_until'], $now + $delay);
+                    $this->state['live']['scan_quota_wait'] = false;
+                }
                 $this->alert('live-poll', '⚠️ دریافت نتیجه تست لایو با خطا مواجه شد؛ IP تأیید نشده و DNS از روی این تست تغییر نمی‌کند.');
             }
-            if ($now - $a['created_at'] > $this->config['live_job_timeout'] && $this->state['live']['active']) { $this->liveFinished(false, $now, 'مهلت تست لایو تمام شد'); }
             $this->save(); return;
         }
         if ($now < $this->state['live']['next_submit_at']) { return; }
@@ -298,8 +362,8 @@ trait LiveOperations
         try {
             $meta = $this->api->liveMeta();
         } catch (Throwable $e) {
-            $this->state['live']['blocked_until'] = $now + 30;
-            $this->state['live']['scan_quota_wait'] = false;
+            $delay = $e instanceof HttpFailure && $e->status === 429 ? max(60, $e->retryAfter) : 30;
+            $this->deferPreflight($intent, $now, $delay);
             $cause = $this->connectionFailure('live', $e);
             $this->alert('live-meta', "⚠️ دریافت اطلاعات API لایو ناموفق بود.\n{$cause}");
             $this->save();
@@ -312,8 +376,7 @@ trait LiveOperations
         }
         if ($issue !== null) {
             $this->recordConnection('live', $issue, false);
-            $this->state['live']['blocked_until'] = $now + 30;
-            $this->state['live']['scan_quota_wait'] = false;
+            $this->deferPreflight($intent, $now, 30);
             $this->alert('live-meta', "⚠️ تست جدید به تعویق افتاد.\n{$issue}");
             $this->save();
             return;
@@ -323,7 +386,7 @@ trait LiveOperations
         $used = max($this->state['live']['observed_used'], count($this->state['live']['history']));
         $reserve = $intent['purpose'] === 'scan' ? $this->config['live_scan_reserve'] : 0;
         if ($used >= max(0, $this->state['live']['limit'] - $reserve)) {
-            $this->state['live']['blocked_until'] = $now + 60;
+            $this->deferPreflight($intent, $now, 60);
             // Do not hold emergency preflights behind a scan's reserved quota.
             $this->state['live']['scan_quota_wait'] = $intent['purpose'] === 'scan';
             $this->alert('live-quota-' . $intent['purpose'], '⏳ اسکن/تست در انتظار سهمیه API است؛ محدودیت ساعتی رعایت می‌شود. ' . ($reserve ? 'بخشی از سهمیه برای تست قبل از DNS رزرو است.' : ''));
@@ -352,7 +415,8 @@ trait LiveOperations
                 // A definite rejection is safe to retry later; do not consume/advance this IP.
                 if ($intent['purpose'] === 'scan') { unset($this->state['pool'][$intent['ip']]); }
                 $this->state['live']['active'] = null;
-                $this->state['live']['blocked_until'] = $now + max(60, $e->retryAfter);
+                $this->deferPreflight($intent, $now, max(60, $e->retryAfter));
+                if ($e->status === 429) { array_pop($this->state['live']['history']); }
                 if ($e->status !== 429) { $this->state['scan']['paused'] = true; }
                 $this->alert('live-create-rejected', '⚠️ API ایجاد تست را رد کرد (HTTP ' . $e->status . '). IP مصرف نشد؛ محدودیت یا تنظیمات را بررسی کنید.');
             } else {
