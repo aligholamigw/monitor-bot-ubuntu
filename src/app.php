@@ -277,6 +277,9 @@ final class App
                     $this->target($domain); $t = $this->state['targets'][$domain];
                     $reply .= "\n\n{$domain}: " . ($t['current_ip'] ?? 'نامشخص') . (!empty($t['pending'])
                         ? ($t['pending']['attempts'] === 0 ? ' [در انتظار تست نهایی/تغییر]' : ' [پاسخ DNS در انتظار تطبیق]') : '');
+                    if (!empty($t['rotation_note'])) { $reply .= "\nℹ️ " . $t['rotation_note']; }
+                    $wait = max(0, ($t['not_before'] ?? 0) - time());
+                    if ($wait > 0) { $reply .= "\n⏳ مهلت DNS: {$wait} ثانیه تا امکان تعویض"; }
                     foreach ($this->config['workers'] as $worker) {
                         $s = $t['samples'][$worker] ?? [];
                         $age = isset($s['ts']) ? max(0, time() - $s['ts']) : null;
@@ -329,10 +332,36 @@ final class App
         $t['current_ip'] = $p['new']; $t['changed_at'] = $now;
         $ttl = (int)($record['ttl'] ?? 1); if ($ttl <= 1) { $ttl = 300; }
         $t['not_before'] = $now + max($this->config['cooldown_seconds'], $ttl + $this->config['dns_grace_seconds']);
+        unset($t['manual_sample_after']);
         $t['samples'] = []; $t['pending'] = null; $t['awaiting_health'] = true;
         $t['last_live_verification'] = $p['proof'] ?? null;
         $this->queue("🔄 تغییر DNS تأیید شد\n{$domain}\n{$p['old']} → {$p['new']}\nعلت: {$p['reason']}\nدر انتظار تست تازه پس از مهلت DNS.");
         $this->save();
+    }
+
+    private function observeManualDnsChange(string $domain, array $record, int $now): void
+    {
+        $target = &$this->state['targets'][$domain];
+        // Cloudflare's record timestamp gives a more precise boundary than the next cron run.
+        $changed = $now;
+        $modifiedOn = (string)($record['modified_on'] ?? '');
+        if (preg_match('/^\d{4}-\d{2}-\d{2}T.*Z$/D', $modifiedOn)) {
+            $parsed = strtotime($modifiedOn);
+            if ($parsed !== false && $parsed > 0 && $parsed <= $now) { $changed = $parsed; }
+        }
+        $ttl = (int)($record['ttl'] ?? 1);
+        if ($ttl <= 1) { $ttl = 300; }
+        $target['samples'] = [];
+        $target['awaiting_health'] = false;
+        // A manual edit gets its DNS cache window, not the cooldown for repeated bot rotations.
+        $target['not_before'] = $changed + $ttl + $this->config['dns_grace_seconds'];
+        if (empty($record['proxied'])) {
+            $target['manual_sample_after'] = $changed;
+        } else {
+            // Proxied addresses do not reveal origin changes to the monitor.
+            unset($target['manual_sample_after']);
+        }
+        $this->alert('external-' . $domain, "ℹ️ تغییر دستی DNS برای {$domain} ثبت شد. نمونه‌های قبلی پاک شدند و تعویض پس از مهلت DNS قابل انجام است.");
     }
     private function reconcile(string $domain, array $record, int $now, bool $allowMutation = true): void
     {
@@ -369,14 +398,12 @@ final class App
         $dns = [];
         foreach ($this->config['domains'] as $domain) {
             $this->target($domain);
+            unset($this->state['targets'][$domain]['rotation_note']);
             try {
                 $dns[$domain] = $this->dns($domain);
                 $old = $this->state['targets'][$domain]['current_ip'];
                 if ($old !== null && $old !== $dns[$domain]['content'] && empty($this->state['targets'][$domain]['pending'])) {
-                    $this->state['targets'][$domain]['samples'] = [];
-                    $ttl = (int)($dns[$domain]['ttl'] ?? 300); if ($ttl <= 1) { $ttl = 300; }
-                    $this->state['targets'][$domain]['not_before'] = $now + max($this->config['cooldown_seconds'], $ttl + $this->config['dns_grace_seconds']);
-                    $this->alert('external-' . $domain, "ℹ️ تغییر DNS خارج از ربات مشاهده شد: {$domain}. شمارش قبلی پاک و مهلت DNS اعمال شد.");
+                    $this->observeManualDnsChange($domain, $dns[$domain], $now);
                 }
                 $this->state['targets'][$domain]['current_ip'] = $dns[$domain]['content'];
             } catch (Throwable $e) { $this->alert('dns-' . $domain, "⛔ خواندن رکورد DNS ممکن نشد یا رکورد مبهم است: {$domain}. تعویض متوقف می‌ماند."); }
@@ -421,10 +448,13 @@ final class App
                 && ($sources[$c['source_id'] ?? '']['enabled'] ?? false) === true));
             if (count($matches) !== 1) {
                 $this->cancelUnsent($domain);
+                $t['rotation_note'] = 'برای این دامنه دقیقاً یک کانفیگ فعال پیدا نشد.';
                 $t['samples'] = []; $this->alert('config-' . $domain, "⚠️ برای {$domain} دقیقاً یک کانفیگ فعال پیدا نشد؛ تعویض متوقف شد."); continue;
             }
             $c = $matches[0]; $key = $c['source_id'] . ':' . $c['id'];
             if (($t['config_key'] ?? '') !== $key) { $t['samples'] = []; $t['config_key'] = $key; }
+            $dnsMatches = isset($dns[$domain]) && (!empty($dns[$domain]['proxied']) || ($c['entry_ip'] ?? '') === $dns[$domain]['content']);
+            $sampleAfter = max($this->state['sample_floor'] ?? 0, $t['manual_sample_after'] ?? $t['not_before'] ?? 0);
             $trigger = []; $healthy = 0;
             foreach ($this->config['workers'] as $worker) {
                 $sample = $data['latest'][$key][$worker] ?? [];
@@ -451,20 +481,41 @@ final class App
                     $red = in_array($status, $this->config['red_statuses'], true);
                     $continuous = isset($previous['ts']) && $ts - $previous['ts'] <= $this->config['max_sample_gap'];
                     $count = $red ? ($continuous ? (int)($previous['count'] ?? 0) : 0) + 1 : 0;
-                    if ($ts <= ($t['not_before'] ?? 0)) { $count = 0; }
                     $t['samples'][$worker] = ['ts' => $ts, 'count' => $count, 'status' => $status];
+                }
+                if (!$dnsMatches || $ts <= $sampleAfter) {
+                    $t['samples'][$worker]['count'] = 0;
                 }
                 $s = $t['samples'][$worker] ?? [];
                 if (in_array($s['status'] ?? '', $this->config['red_statuses'], true) && ($s['count'] ?? 0) >= $this->state['threshold']) { $trigger[] = $worker; }
                 if (($s['status'] ?? '') === 'ok' && $ts > ($t['not_before'] ?? 0)) { $healthy++; }
+            }
+            if (!isset($dns[$domain])) {
+                $t['rotation_note'] = 'رکورد فعلی Cloudflare خوانده نشد.';
+                if (!empty($t['pending'])) { $t['pending']['eligible_until'] = 0; }
+                continue;
+            }
+            if (!$dnsMatches) {
+                $t['rotation_note'] = 'در انتظار تطبیق IP مانیتورینگ با DNS فعلی.';
+                if (!empty($t['pending'])) { $t['pending']['eligible_until'] = 0; }
+                $this->alert('resolve-' . $domain, "⚠️ IP ثبت‌شده در مانیتورینگ با DNS فعلی {$domain} متفاوت است. شمارش تا تطبیق متوقف است.");
+                continue;
             }
             if (!empty($t['awaiting_health']) && $healthy === count($this->config['workers'])) {
                 $t['awaiting_health'] = false;
                 $this->queue("✅ اتصال {$domain} پس از تغییر IP روی MCI-THR و MKH-THR تأیید شد.");
             }
             $shouldRotate = $this->config['operator_policy'] === 'all' ? count($trigger) === count($this->config['workers']) : count($trigger) > 0;
-            if (!$shouldRotate) { $this->cancelUnsent($domain); continue; }
-            if ($this->state['paused'] || $now < $t['not_before']) { continue; }
+            if (!$shouldRotate) {
+                $t['rotation_note'] = 'در انتظار تعداد لازم از تست‌های تازه و مستقل.';
+                $this->cancelUnsent($domain);
+                continue;
+            }
+            if ($this->state['paused']) { $t['rotation_note'] = 'تعویض دستی متوقف شده است.'; continue; }
+            if ($now < $t['not_before']) {
+                $t['rotation_note'] = 'آستانهٔ خرابی رسیده است. تعویض پس از مهلت DNS بررسی می‌شود.';
+                continue;
+            }
             if (count($dns) !== count($this->config['domains'])) { continue; }
             if (!empty($t['pending'])) {
                 $t['pending']['eligible_until'] = $now + 60;
@@ -473,13 +524,16 @@ final class App
                 continue;
             }
             if (!$this->state['dry_run'] && $now < $this->state['live']['blocked_until']
-                && !($this->state['live']['scan_quota_wait'] ?? false)) { continue; }
-            // For DNS-only records, wait for monitoring's address cache to catch up.
-            if (empty($dns[$domain]['proxied']) && ($c['entry_ip'] ?? '') !== $dns[$domain]['content']) {
-                $this->alert('resolve-' . $domain, "⚠️ IP ثبت‌شده در مانیتورینگ با DNS فعلی {$domain} متفاوت است؛ تعویض بعدی متوقف شد."); continue;
+                && !($this->state['live']['scan_quota_wait'] ?? false)) {
+                $t['rotation_note'] = 'در انتظار در دسترس شدن تست لایو یا سهمیهٔ API.';
+                continue;
             }
             $candidate = $this->poolCandidate(array_merge(array_column($dns, 'content'), $simulated));
-            if ($candidate === null) { $this->alert('no-ip', "⛔ IP آماده و متفاوت برای {$domain} موجود نیست. از «مخزن IP» یا «اسکن» استفاده کنید."); continue; }
+            if ($candidate === null) {
+                $t['rotation_note'] = 'IP جایگزین در مخزن آماده نیست.';
+                $this->alert('no-ip', "⛔ IP آماده و متفاوت برای {$domain} موجود نیست. از «مخزن IP» یا «اسکن» استفاده کنید.");
+                continue;
+            }
             $reason = implode(', ', $trigger) . ' / ' . $this->state['threshold'] . ' قرمز متوالی';
             if ($this->state['dry_run']) {
                 $simulated[] = $candidate;
